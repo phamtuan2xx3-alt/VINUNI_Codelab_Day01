@@ -143,37 +143,46 @@ class TestCallAnthropic(unittest.TestCase):
 
 class TestCompareModels(unittest.TestCase):
 
-    def test_compare_models_evaluates_correct_costs(self):
-        with patch.object(_m, "call_openai") as mock_openai, \
-             patch.object(_m, "call_gemini") as mock_gemini:
-             
-            # Setup mock returns
-            mock_openai.side_effect = [
-                ("GPT-4o Response", 0.5, {"input_tokens": 10, "output_tokens": 20}),       # 1st call: gpt-4o
-                ("GPT-4o-Mini Response", 0.3, {"input_tokens": 10, "output_tokens": 20}),  # 2nd call: gpt-4o-mini
-            ]
-            mock_gemini.return_value = (
-                "Gemini Response",
-                0.4,
-                {"input_tokens": 10, "output_tokens": 20}
+    def test_compares_requested_gemini_models_and_includes_thinking_cost(self):
+        expected_models = (
+            "gemini-2.5-flash", "gemini-3-flash-preview",
+            "gemini-3.1-flash-lite", "gemini-3.6-flash",
+            "gemini-3.5-flash-lite", "gemini-3.8-flash",
+        )
+        expected_costs = (0.000078, 0.000095, 0.0000475,
+                          0.00012, 0.000078, 0.00012)
+        with patch.object(_m, "call_openai") as openai_call, \
+             patch.object(_m, "call_gemini") as gemini_call:
+            gemini_call.return_value = (
+                "Gemini response", 0.4,
+                {"input_tokens": 10, "output_tokens": 20, "thinking_tokens": 10},
             )
-
             result = compare_models("Prompt")
+            self.assertEqual(tuple(result), expected_models)
+            self.assertEqual(gemini_call.call_count, 6)
+            openai_call.assert_not_called()
+            for call, model, cost in zip(gemini_call.call_args_list,
+                                         expected_models, expected_costs):
+                self.assertEqual(call.args, ("Prompt",))
+                self.assertEqual(call.kwargs, {"model": model, "max_tokens": 1024})
+                self.assertEqual(result[model]["status"], "ok")
+                self.assertEqual(result[model]["response"], "Gemini response")
+                self.assertAlmostEqual(result[model]["cost"], cost, places=10)
 
-            # Verify keys exist
-            self.assertIn("gpt4o", result)
-            self.assertIn("gpt4o_mini", result)
-            self.assertIn("gemini_flash", result)
-
-            # Verify exact cost calculations
-            # gpt-4o: (10 * 5.0 + 20 * 20.0) / 1,000,000 = 0.00045
-            self.assertAlmostEqual(result["gpt4o"]["cost"], 0.00045, places=8)
-            
-            # gpt-4o-mini: (10 * 0.150 + 20 * 0.600) / 1,000,000 = 0.0000135
-            self.assertAlmostEqual(result["gpt4o_mini"]["cost"], 0.0000135, places=8)
-            
-            # gemini-2.5-flash: (10 * 0.075 + 20 * 0.300) / 1,000,000 = 0.00000675
-            self.assertAlmostEqual(result["gemini_flash"]["cost"], 0.00000675, places=8)
+    def test_failure_does_not_stop_other_models_or_expose_error_message(self):
+        success = ("OK", 0.1, {"input_tokens": 2, "output_tokens": 1})
+        with patch.object(_m, "call_gemini") as gemini_call:
+            gemini_call.side_effect = [
+                success, RuntimeError("secret-in-error"),
+                success, success, success, success,
+            ]
+            result = compare_models("Hello")
+        self.assertEqual(len(result), 6)
+        failed = result["gemini-3-flash-preview"]
+        self.assertEqual(failed["status"], "error")
+        self.assertIsNone(failed["cost"])
+        self.assertNotIn("secret-in-error", failed["error"])
+        self.assertEqual(result["gemini-3.8-flash"]["status"], "ok")
 
 
 class TestRetryWithBackoff(unittest.TestCase):
@@ -207,7 +216,7 @@ class TestBatchCompareAndFormat(unittest.TestCase):
 
     def test_batch_runs_and_formats_table(self):
         with patch.object(_m, "compare_models") as mock_comp:
-            def _get_mock():
+            def _get_mock(prompt):
                 return {
                     "gpt4o": {"response": "GPT-4o response content here", "latency": 0.5, "cost": 0.00045, "input_tokens": 10, "output_tokens": 20},
                     "gpt4o_mini": {"response": "GPT-4o-Mini response content here", "latency": 0.3, "cost": 0.0000135, "input_tokens": 10, "output_tokens": 20},
